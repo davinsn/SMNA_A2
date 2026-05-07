@@ -1,0 +1,55 @@
+Topic - "How does social media discussion influence 
+        perceptions of safety in Formula 1 after major 
+        accidents?"
+
+
+1. Introduction + Research Question
+2. Data Collection
+3. Data Cleaning
+4. Pre-processing Strategy Comparison (WITH evaluation + final choice)
+5. Exploratory Data Analysis (EDA)
+6. Feature Engineering
+    - TF-IDF
+    - Bigrams
+7. Sentiment Analysis (VADER)
+    - 
+        - Evaluation
+8. Topic Modelling (LDA)
+    - 
+        - Evaluation (perplexity, coherence)
+9. BERT Analysis (ADVANCED)
+    - 
+        - Comparison with VADER
+10. Network Construction
+11. Network Analysis
+12. NLP + Network Integration (CRITICAL INSIGHTS)
+13. Results (findings only)
+14. Discussion (interpretation + real-world meaning)
+15. Limitations
+16. Conclusion
+17. References
+
+^ Ideal layout for the notebook.
+
+TO DO LIST
+
+1 - Combine network + NLP
+
+2 - Justify every method
+
+3 - Interpret results (not just show graphs)
+
+4 - Compare methods (e.g., LDA vs BERT)
+
+5 - Show insight, not just output
+
+
+THINGS THAT NEED EXTRA FOCUS - 
+
+1 - Analysis needs to be more critical 
+
+2 - Require validation and/or comparison of model results 
+
+3 - LDA and LSA parameters need to be tuned and justified 
+
+4 - Quantitative evaluation of pre processing impact
