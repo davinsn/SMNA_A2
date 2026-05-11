@@ -337,6 +337,32 @@ def get_video_details(client, video_ids):
     return videos
 
 
+
+def process_comment(text):
+
+    try:
+        lang = detect(text)
+
+    except LangDetectException:
+        lang = "unknown"
+
+    translated = text
+
+    # Translate non-English comments
+    if lang != "en" and text.strip():
+
+        try:
+            translated = GoogleTranslator(
+                source="auto",
+                target="en"
+            ).translate(text)
+
+        except Exception:
+            translated = text
+
+    return translated, lang
+
+
 def get_comments_for_video(client, video_id, max_comments=500):
 
     comments = []
