@@ -373,7 +373,6 @@ def get_comments_for_video(client, video_id, max_comments=500):
         batch = min(100, max_comments - len(comments))
 
         try:
-
             resp = client.commentThreads().list(
                 videoId=video_id,
                 part="snippet",
@@ -390,14 +389,25 @@ def get_comments_for_video(client, video_id, max_comments=500):
         for thread in resp.get("items", []):
 
             top = thread["snippet"]["topLevelComment"]["snippet"]
-
             raw_text = top.get("textDisplay", "")
 
-            translated, lang = process_comment(raw_text)
+            # Skip empty comments
+            if not raw_text.strip():
+                continue
+
+            # Detect language
+            try:
+                lang = detect(raw_text)
+            except:
+                lang = "unknown"
+
+            # Keep English comments only
+            if lang != "en":
+                continue
 
             comments.append({
                 "author": top.get("authorDisplayName", ""),
-                "text": translated,
+                "text": raw_text,
                 "originalText": raw_text,
                 "originalLang": lang,
                 "publishedAt": top.get("publishedAt", ""),
