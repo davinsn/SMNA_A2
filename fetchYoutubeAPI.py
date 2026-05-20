@@ -15,11 +15,12 @@
 #
 # Purpose:
 # Fetches Formula 1 safety-related YouTube videos and comments
-# from 2020 onwards for sentiment analysis, topic modelling,
+# from 2018 onwards for sentiment analysis, topic modelling,
 # and network analysis.
 #
 
 import json
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,34 +28,30 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from langdetect import detect, DetectorFactory
 from langdetect.lang_detect_exception import LangDetectException
 from deep_translator import GoogleTranslator
+from googleapiclient.errors import HttpError
 
 from youtubeClient import youtubeClient
 
 DetectorFactory.seed = 0
 
 
-# Search queries — Formula 1 safety discussions from 2020 onwards
+# ── Search queries ────────────────────────────────────────────────────────────
 
 SEARCH_QUERIES = [
-    "Formula 1 crash analysis",
-    "F1 major accidents analysis",
-    "Formula 1 safety discussion",
-    "F1 halo safety analysis",
     "Formula 1 dangerous crashes",
-    "Jules Bianchi crash analysis",
     "Romain Grosjean Bahrain crash analysis",
-    "F1 crash reaction",
-    "Formula 1 driver safety",
-    "F1 FIA safety regulations",
-    "Formula 1 accidents documentary",
     "F1 safety improvements",
     "Formula 1 controversial crashes",
-    "F1 race accidents analysis",
     "Formula 1 crash aftermath discussion",
+    "Romain Grosjean fire Bahrain 2020",
+    "Lewis Hamilton crash 2021",
+    "Max Verstappen crash 2021",
+    "Zhou Guanyu crash Silverstone 2022",
+    "Formula 1 safety car controversy",
 ]
 
 
-# Keyword filter lists
+# ── Keyword filter lists ──────────────────────────────────────────────────────
 
 EXCLUDE_KEYWORDS = [
     "#shorts", "shorts", "meme", "edit",
@@ -110,8 +107,51 @@ OFFICIAL_CHANNEL_HINTS = [
     "autosport", "bbc sport",
 ]
 
+# Comments containing ONLY these patterns are considered junk
+JUNK_COMMENT_PATTERNS = [
+    r"^[\s\d]+$",                        # only numbers/whitespace
+    r"^(.)\1{4,}$",                      # repeated single character e.g. "lolololol"
+    r"^(ha|lol|lmao|haha|😂|🤣){2,}$",  # pure laugh filler
+    r"^\W+$",                            # only punctuation/symbols
+]
 
-# Relevance scoring
+
+# ── Text cleaning ─────────────────────────────────────────────────────────────
+
+def strip_emojis_and_symbols(text):
+    """Keep only ASCII letters, digits, basic punctuation, and spaces."""
+    if not text:
+        return ""
+    # Remove emoji and non-ASCII characters
+    text = text.encode("ascii", "ignore").decode("ascii")
+    # Remove anything that isn't a letter, digit, common punctuation, or space
+    text = re.sub(r"[^a-zA-Z0-9\s.,!?'\"-]", " ", text)
+    # Collapse repeated whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def is_junk_comment(text):
+    """Return True if the comment carries no useful content."""
+    t = text.strip().lower()
+
+    # Too short to be meaningful after cleaning
+    if len(t) < 10:
+        return True
+
+    # Fewer than 3 words
+    if len(t.split()) < 3:
+        return True
+
+    # Matches a known junk pattern
+    for pattern in JUNK_COMMENT_PATTERNS:
+        if re.fullmatch(pattern, t, re.IGNORECASE):
+            return True
+
+    return False
+
+
+# ── Relevance scoring ─────────────────────────────────────────────────────────
 
 def normalize_text(text):
     text = (text or "").lower()
@@ -132,18 +172,14 @@ def calculate_relevance_score(title, description="", channel_title=""):
 
     score = 0
 
-    # Must mention Formula 1
+    # Must mention Formula 1 in some form
     if contains_any(combined, FORMULA1_KEYWORDS):
         score += 4
     else:
         return -100
 
-    # Reject unwanted content
+    # Hard reject unwanted content types
     if contains_any(combined, EXCLUDE_KEYWORDS):
-        return -100
-
-    # Must contain F1 context
-    if not contains_any(combined, F1_REQUIRED_KEYWORDS):
         return -100
 
     # Reward safety discussion
@@ -154,15 +190,15 @@ def calculate_relevance_score(title, description="", channel_title=""):
     if contains_any(combined, ACCIDENT_KEYWORDS):
         score += 4
 
-    # Reward analytical discussion
+    # Reward analytical content
     if contains_any(combined, ANALYSIS_KEYWORDS):
         score += 4
 
-    # Reward contextual relevance
+    # Reward strong contextual relevance (capped at 5)
     hits = sum(1 for kw in STRONG_CONTEXT_KEYWORDS if kw in combined)
     score += min(hits, 5)
 
-    # Reward official/reliable channels
+    # Reward known reliable channels
     if contains_any(c, OFFICIAL_CHANNEL_HINTS):
         score += 3
 
@@ -175,17 +211,15 @@ def assign_video_category(title, description=""):
 
     if contains_any(combined, SAFETY_KEYWORDS):
         return "safety_discussion"
-
     elif contains_any(combined, ACCIDENT_KEYWORDS):
         return "accident_analysis"
-
     elif contains_any(combined, ANALYSIS_KEYWORDS):
         return "technical_analysis"
 
     return "other"
 
 
-# ISO 8601 duration parser
+# ── ISO 8601 duration parser ──────────────────────────────────────────────────
 
 def parse_iso8601_duration(s):
 
@@ -204,7 +238,7 @@ def parse_iso8601_duration(s):
     )
 
 
-# YouTube API helpers
+# ── YouTube API helpers ───────────────────────────────────────────────────────
 
 def search_videos_for_query(
     client,
@@ -247,9 +281,7 @@ def deduplicate(items):
     out = []
 
     for item in items:
-
         vid = item["id"]["videoId"]
-
         if vid not in seen:
             seen.add(vid)
             out.append(item)
@@ -257,8 +289,12 @@ def deduplicate(items):
     return out
 
 
-def rank_and_filter(items, min_score=7, max_videos=30):
-
+def rank_and_filter(items, min_score=5, max_videos=60):
+    """
+    Lenient filter: min_score lowered to 5 (was 7) so more borderline
+    F1 safety videos pass through. Hard exclusions (EXCLUDE_KEYWORDS)
+    still apply inside calculate_relevance_score.
+    """
     scored = []
 
     for item in items:
@@ -311,75 +347,88 @@ def get_video_details(client, video_ids):
             item.get("contentDetails", {}).get("duration", "PT0S")
         )
 
-        # Remove very short videos
+        # Skip very short videos
         if duration < 180:
             continue
 
         snippet = item.get("snippet", {})
-        stats = item.get("statistics", {})
-
-        title = snippet.get("title", "")
-        desc = snippet.get("description", "")
+        stats   = item.get("statistics", {})
+        title   = snippet.get("title", "")
+        desc    = snippet.get("description", "")
 
         videos.append({
-            "title": title,
-            "videoId": item["id"],
+            "title":        title,
+            "videoId":      item["id"],
             "channelTitle": snippet.get("channelTitle", ""),
-            "publishedAt": snippet.get("publishedAt", ""),
-            "viewCount": int(stats.get("viewCount", 0)),
-            "likeCount": int(stats.get("likeCount", 0)),
+            "publishedAt":  snippet.get("publishedAt", ""),
+            "viewCount":    int(stats.get("viewCount", 0)),
+            "likeCount":    int(stats.get("likeCount", 0)),
             "commentCount": int(stats.get("commentCount", 0)),
             "durationSecs": duration,
-            "category": assign_video_category(title, desc),
-            "comments": [],
+            "category":     assign_video_category(title, desc),
+            "comments":     [],
         })
 
     return videos
 
 
+# ── Comment processing ────────────────────────────────────────────────────────
 
-def process_comment(text):
-
+def process_comment(raw_text):
+    """
+    Detect language, translate non-English to English,
+    then strip emojis/symbols from the result.
+    Returns (cleaned_text, original_lang, was_translated).
+    """
     try:
-        lang = detect(text)
-
+        lang = detect(raw_text)
     except LangDetectException:
         lang = "unknown"
 
-    translated = text
+    translated_text = raw_text
+    was_translated  = False
 
-    # Translate non-English comments
-    if lang != "en" and text.strip():
-
+    if lang != "en" and raw_text.strip():
         try:
-            translated = GoogleTranslator(
+            result = GoogleTranslator(
                 source="auto",
                 target="en"
-            ).translate(text)
-
+            ).translate(raw_text)
+            # Translator returns None for symbol-only / empty input
+            translated_text = result if result is not None else raw_text
+            was_translated  = translated_text != raw_text
         except Exception:
-            translated = text
+            translated_text = raw_text   # fall back to original if API fails
 
-    return translated, lang
+    # Guard against None before stripping
+    cleaned_text = strip_emojis_and_symbols(translated_text or "")
+
+    return cleaned_text, lang, was_translated
 
 
-def get_comments_for_video(client, video_id, max_comments=500):
-
-    comments = []
+def get_comments_for_video(client, video_id, max_comments=800):
+    """
+    Fetch comments, translate non-English ones, strip noise,
+    and reject junk. Fetches up to 3× the target from the API
+    to compensate for junk/language drop-off.
+    """
+    raw_pool        = []
     next_page_token = None
+    fetch_target    = min(max_comments * 3, 3000)
 
-    while len(comments) < max_comments:
+    # ── Phase 1: collect raw comments from API ────────────────────────────
+    while len(raw_pool) < fetch_target:
 
-        batch = min(100, max_comments - len(comments))
+        batch = min(100, fetch_target - len(raw_pool))
 
         try:
             resp = client.commentThreads().list(
-                videoId=video_id,
-                part="snippet",
-                maxResults=batch,
-                textFormat="plainText",
-                pageToken=next_page_token,
-                order="relevance",
+                videoId     = video_id,
+                part        = "snippet",
+                maxResults  = batch,
+                textFormat  = "plainText",
+                pageToken   = next_page_token,
+                order       = "time",       # "time" gives more unique comments than "relevance"
             ).execute()
 
         except Exception as e:
@@ -387,52 +436,55 @@ def get_comments_for_video(client, video_id, max_comments=500):
             break
 
         for thread in resp.get("items", []):
-
-            top = thread["snippet"]["topLevelComment"]["snippet"]
-            raw_text = top.get("textDisplay", "")
-
-            # Skip empty comments
-            if not raw_text.strip():
+            top      = thread["snippet"]["topLevelComment"]["snippet"]
+            raw_text = top.get("textDisplay", "").strip()
+            if not raw_text:
                 continue
-
-            # Detect language
-            try:
-                lang = detect(raw_text)
-            except:
-                lang = "unknown"
-
-            # Keep English comments only
-            if lang != "en":
-                continue
-
-            comments.append({
-                "author": top.get("authorDisplayName", ""),
-                "text": raw_text,
-                "originalText": raw_text,
-                "originalLang": lang,
+            raw_pool.append({
+                "author":      top.get("authorDisplayName", ""),
+                "rawText":     raw_text,
                 "publishedAt": top.get("publishedAt", ""),
-                "likeCount": top.get("likeCount", 0),
+                "likeCount":   top.get("likeCount", 0),
             })
 
-            if len(comments) >= max_comments:
-                break
-
         next_page_token = resp.get("nextPageToken")
-
         if not next_page_token:
             break
+
+    # ── Phase 2: clean, translate, filter ────────────────────────────────
+    comments = []
+
+    for c in raw_pool:
+
+        if len(comments) >= max_comments:
+            break
+
+        cleaned_text, lang, was_translated = process_comment(c["rawText"])
+
+        # Drop junk after cleaning
+        if is_junk_comment(cleaned_text):
+            continue
+
+        comments.append({
+            "author":         c["author"],
+            "text":           cleaned_text,          # cleaned + translated
+            "originalText":   c["rawText"],           # raw as received from API
+            "originalLang":   lang,
+            "translated":     was_translated,
+            "publishedAt":    c["publishedAt"],
+            "likeCount":      c["likeCount"],
+        })
 
     return comments
 
 
-# Parallel comment fetching
+# ── Parallel comment fetching ─────────────────────────────────────────────────
 
 def fetch_comments_worker(video, max_comments):
 
     client = youtubeClient()
 
     try:
-
         comments = get_comments_for_video(
             client,
             video["videoId"],
@@ -441,10 +493,7 @@ def fetch_comments_worker(video, max_comments):
 
         video["comments"] = comments
 
-        translated = sum(
-            1 for c in comments
-            if c["originalLang"] != "en"
-        )
+        translated = sum(1 for c in comments if c["translated"])
 
         print(
             f"  ✓ {video['title'][:65]}\n"
@@ -452,30 +501,20 @@ def fetch_comments_worker(video, max_comments):
         )
 
     except Exception as e:
-
         print(f"  ✗ {video['title'][:65]} -> Error: {e}")
-
         video["comments"] = []
 
     return video
 
 
-def fetch_comments_parallel(
-    videos,
-    max_comments=500,
-    max_workers=4
-):
+def fetch_comments_parallel(videos, max_comments=800, max_workers=4):
 
     results = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
 
         futures = [
-            executor.submit(
-                fetch_comments_worker,
-                v,
-                max_comments
-            )
+            executor.submit(fetch_comments_worker, v, max_comments)
             for v in videos
         ]
 
@@ -485,58 +524,76 @@ def fetch_comments_parallel(
     return results
 
 
-# Main orchestrator
+# ── Main orchestrator ─────────────────────────────────────────────────────────
+
+CANDIDATES_CACHE = "candidates_cache.json"
+
 
 def fetchYoutubeData(
     searchQueries,
-    maxVideosPerQuery=50,
-    maxCommentsPerVideo=500,
-    maxFinalVideos=30,
-    outputFile="youtubeDataDump.json",
-    publishedAfter=None,
-    maxWorkers=4,
-    minRelevanceScore=7,
+    maxVideosPerQuery  = 50,
+    maxCommentsPerVideo= 800,
+    maxFinalVideos     = 60,
+    outputFile         = "youtubeDataDump.json",
+    publishedAfter     = None,
+    maxWorkers         = 4,
+    minRelevanceScore  = 5,
 ):
 
     client = youtubeClient()
 
-    # STEP 1 — Collect candidate videos
-
+    # ── STEP 1: Collect candidate videos (with cache) ─────────────────────
     print("\n" + "=" * 65)
     print("STEP 1  Searching YouTube for Formula 1 safety videos")
     print("=" * 65)
 
-    all_items = []
+    if os.path.exists(CANDIDATES_CACHE):
+        print(f"  Loading candidates from cache: {CANDIDATES_CACHE}")
+        with open(CANDIDATES_CACHE) as f:
+            all_items = json.load(f)
+        print(f"  {len(all_items)} candidates loaded (no API quota used)")
 
-    for query in searchQueries:
+    else:
+        all_items = []
 
-        print(f"  Query: '{query}'")
+        for query in searchQueries:
+            print(f"  Query: '{query}'")
+            try:
+                items = search_videos_for_query(
+                    client        = client,
+                    query         = query,
+                    max_videos    = maxVideosPerQuery,
+                    published_after = publishedAfter,
+                )
+                print(f"    -> {len(items)} candidates found")
+                all_items.extend(items)
 
-        items = search_videos_for_query(
-            client=client,
-            query=query,
-            max_videos=maxVideosPerQuery,
-            published_after=publishedAfter,
-        )
+            except HttpError as e:
+                if "quotaExceeded" in str(e):
+                    print(
+                        f"  ⚠ Quota exceeded — stopping search early.\n"
+                        f"    Proceeding with {len(all_items)} candidates collected so far."
+                    )
+                    break
+                raise
 
-        print(f"    -> {len(items)} candidates found")
+        all_items = deduplicate(all_items)
+        print(f"\nTotal unique candidates: {len(all_items)}")
 
-        all_items.extend(items)
+        # Save so tomorrow's run skips search entirely
+        with open(CANDIDATES_CACHE, "w") as f:
+            json.dump(all_items, f)
+        print(f"  Candidates cached to {CANDIDATES_CACHE}")
 
-    all_items = deduplicate(all_items)
-
-    print(f"\nTotal unique candidates: {len(all_items)}")
-
-    # STEP 2 — Relevance filtering
-
+    # ── STEP 2: Relevance filtering ───────────────────────────────────────
     print("\n" + "=" * 65)
     print("STEP 2  Filtering and ranking by F1 safety relevance")
     print("=" * 65)
 
     filtered = rank_and_filter(
         all_items,
-        min_score=minRelevanceScore,
-        max_videos=maxFinalVideos
+        min_score  = minRelevanceScore,
+        max_videos = maxFinalVideos,
     )
 
     print(f"Videos passing filter: {len(filtered)}")
@@ -546,44 +603,33 @@ def fetchYoutubeData(
         return
 
     print("\nSelected videos:")
-
     for item in filtered:
-
-        s = item["snippet"]
-
+        s     = item["snippet"]
         score = calculate_relevance_score(
             s.get("title", ""),
             s.get("description", ""),
             s.get("channelTitle", "")
         )
-
         print(
             f"  [{score:>3}] "
             f"{s.get('title','')[:65]}  |  "
             f"{s.get('channelTitle','')}"
         )
 
-    # STEP 3 — Metadata collection
-
+    # ── STEP 3: Metadata collection ───────────────────────────────────────
     print("\n" + "=" * 65)
     print("STEP 3  Fetching video metadata")
     print("=" * 65)
 
     video_ids = [item["id"]["videoId"] for item in filtered]
+    videos    = get_video_details(client, video_ids)
+    videos.sort(key=lambda v: v["viewCount"], reverse=True)
 
-    videos = get_video_details(client, video_ids)
+    print(f"Videos after metadata filter: {len(videos)}")
 
-    videos.sort(
-        key=lambda v: v["viewCount"],
-        reverse=True
-    )
-
-    print(f"Videos after filtering: {len(videos)}")
-
-    # STEP 4 — Comment collection
-
+    # ── STEP 4: Comment collection ────────────────────────────────────────
     print("\n" + "=" * 65)
-    print("STEP 4  Fetching and translating comments")
+    print("STEP 4  Fetching, translating, and cleaning comments")
     print(
         f"        Target: "
         f"{maxCommentsPerVideo} comments × "
@@ -593,32 +639,19 @@ def fetchYoutubeData(
 
     videos = fetch_comments_parallel(
         videos,
-        max_comments=maxCommentsPerVideo,
-        max_workers=maxWorkers
+        max_comments = maxCommentsPerVideo,
+        max_workers  = maxWorkers,
     )
 
-    # STEP 5 — Save JSON
-
-    total_comments = sum(
-        len(v["comments"]) for v in videos
-    )
-
+    # ── STEP 5: Save JSON ─────────────────────────────────────────────────
+    total_comments   = sum(len(v["comments"]) for v in videos)
     total_translated = sum(
-        sum(
-            1 for c in v["comments"]
-            if c["originalLang"] != "en"
-        )
+        sum(1 for c in v["comments"] if c["translated"])
         for v in videos
     )
 
     with open(outputFile, "w", encoding="utf-8") as f:
-
-        json.dump(
-            {"videos": videos},
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
+        json.dump({"videos": videos}, f, ensure_ascii=False, indent=2)
 
     print("\n" + "=" * 65)
     print("DONE")
@@ -630,20 +663,17 @@ def fetchYoutubeData(
     print("=" * 65)
 
 
-# Entry point
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
 
     fetchYoutubeData(
-        searchQueries=SEARCH_QUERIES,
-        maxVideosPerQuery=60,
-        maxCommentsPerVideo=500,
-        maxFinalVideos=60,
-        outputFile="youtubeDataDump.json",
-
-        # Collect videos from 2020 onwards, including 2026/current videos
-        publishedAfter="2020-01-01T00:00:00Z",
-
-        maxWorkers=4,
-        minRelevanceScore=6,
+        searchQueries      = SEARCH_QUERIES,
+        maxVideosPerQuery  = 50,
+        maxCommentsPerVideo= 800,
+        maxFinalVideos     = 60,
+        outputFile         = "youtubeDataDump.json",
+        publishedAfter     = "2018-01-01T00:00:00Z",
+        maxWorkers         = 4,
+        minRelevanceScore  = 5,
     )
